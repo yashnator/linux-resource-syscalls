@@ -1,0 +1,548 @@
+--- linux/arch/x86/entry/syscalls/syscall_64.tbl	2025-03-07 01:16:54
++++ linux-6.1.6/arch/x86/entry/syscalls/syscall_64.tbl	2025-03-06 21:43:45
+@@ -415,5 +415,11 @@
+ 545	x32	execveat		compat_sys_execveat
+ 546	x32	preadv2			compat_sys_preadv64v2
+ 547	x32	pwritev2		compat_sys_pwritev64v2
++548 common  yashscall	sys_yashscall
++549 common  register    sys_register
++550 common  fetch       sys_fetch
++551 common  deregister  sys_deregister
++552 common  resource_cap    sys_resource_cap
++553 common  resource_reset  sys_resource_reset
+ # This is the end of the legacy x32 range.  Numbers 548 and above are
+ # not special and are not to be used for x32-specific syscalls.
+--- linux/arch/x86/kernel/sys_x86_64.c	2025-03-07 01:16:54
++++ linux-6.1.6/arch/x86/kernel/sys_x86_64.c	2025-03-06 20:42:11
+@@ -89,7 +89,6 @@ SYSCALL_DEFINE6(mmap, unsigned long, addr, unsigned lo
+ {
+ 	if (off & ~PAGE_MASK)
+ 		return -EINVAL;
+-
+ 	return ksys_mmap_pgoff(addr, len, prot, flags, fd, off >> PAGE_SHIFT);
+ }
+ 
+--- linux/fs/open.c	2025-03-07 01:17:01
++++ linux-6.1.6/fs/open.c	2025-03-07 01:10:26
+@@ -33,6 +33,8 @@
+ #include <linux/dnotify.h>
+ #include <linux/compat.h>
+ #include <linux/mnt_idmapping.h>
++
++#include <linux/restracker.h>
+ 
+ #include "internal.h"
+ 
+@@ -1317,6 +1319,13 @@ static long do_sys_openat2(int dfd, const char __user 
+ 		}
+ 	}
+ 	putname(tmp);
++
++	if(fd >= 0) {
++		pid_t curr_pid = current->pid;
++		if(__pid_istracked(curr_pid)) {
++			__restracker_inc_fcnt(curr_pid, current->tgid);
++		}
++	}
+ 	return fd;
+ }
+ 
+@@ -1445,6 +1454,13 @@ SYSCALL_DEFINE1(close, unsigned int, fd)
+ 		     retval == -ERESTART_RESTARTBLOCK))
+ 		retval = -EINTR;
+ 
++	if(retval >= 0) {
++		pid_t curr_pid = current->pid;
++		if(__pid_istracked(curr_pid)) {
++			__restracker_dec_fcnt(curr_pid, current->tgid);
++		}
++	}
++
+ 	return retval;
+ }
+ 
+--- linux/include/linux/syscalls.h	2025-03-07 01:17:02
++++ linux-6.1.6/include/linux/syscalls.h	2025-03-06 21:53:00
+@@ -1161,6 +1161,12 @@ asmlinkage long sys_recv(int, void __user *, size_t, u
+ 				int maxevents, int timeout);
+ asmlinkage long sys_ustat(unsigned dev, struct ustat __user *ubuf);
+ asmlinkage long sys_vfork(void);
++asmlinkage long sys_yashscall(void);
++asmlinkage long sys_register(pid_t);
++asmlinkage long sys_fetch(struct per_proc_resource __user *stats, pid_t pid);
++asmlinkage long sys_deregister(pid_t);
++asmlinkage long sys_resource_cap(pid_t pid, long heap_quota, long file_quota);
++asmlinkage long sys_resource_reset(pid_t pid);
+ asmlinkage long sys_recv(int, void __user *, size_t, unsigned);
+ asmlinkage long sys_send(int, void __user *, size_t, unsigned);
+ asmlinkage long sys_oldumount(char __user *name);
+--- linux/kernel/fork.c	2025-03-07 01:17:02
++++ linux-6.1.6/kernel/fork.c	2025-03-04 09:36:28
+@@ -2780,6 +2780,13 @@ SYSCALL_DEFINE0(vfork)
+ }
+ #endif
+ 
++// Remove this
++SYSCALL_DEFINE0(yashscall)
++{
++	pr_info("Hello from yash's syscall!");
++	return 0;
++}
++
+ #ifdef __ARCH_WANT_SYS_CLONE
+ #ifdef CONFIG_CLONE_BACKWARDS
+ SYSCALL_DEFINE5(clone, unsigned long, clone_flags, unsigned long, newsp,
+--- linux/mm/mmap.c	2025-03-07 01:17:03
++++ linux-6.1.6/mm/mmap.c	2025-03-07 01:09:30
+@@ -52,6 +52,8 @@
+ #include <asm/tlb.h>
+ #include <asm/mmu_context.h>
+ 
++#include <linux/restracker.h>
++
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/mmap.h>
+ 
+@@ -273,6 +275,9 @@ success:
+ 	userfaultfd_unmap_complete(mm, &uf);
+ 	if (populate)
+ 		mm_populate(oldbrk, newbrk - oldbrk);
++	if((newbrk != oldbrk) && (__pid_istracked(current->pid))) {
++		__restracker_change_mem(current->pid, current->tgid, origbrk - oldbrk);
++	}
+ 	return brk;
+ 
+ out:
+@@ -1422,7 +1427,10 @@ unsigned long ksys_mmap_pgoff(unsigned long addr, unsi
+ {
+ 	struct file *file = NULL;
+ 	unsigned long retval;
++	unsigned long old_rss, new_rss;
+ 
++	old_rss = current->mm->total_vm;
++
+ 	if (!(flags & MAP_ANONYMOUS)) {
+ 		audit_mmap_fd(fd, flags);
+ 		file = fget(fd);
+@@ -1436,7 +1444,6 @@ unsigned long ksys_mmap_pgoff(unsigned long addr, unsi
+ 		}
+ 	} else if (flags & MAP_HUGETLB) {
+ 		struct hstate *hs;
+-
+ 		hs = hstate_sizelog((flags >> MAP_HUGE_SHIFT) & MAP_HUGE_MASK);
+ 		if (!hs)
+ 			return -EINVAL;
+@@ -1453,11 +1460,17 @@ unsigned long ksys_mmap_pgoff(unsigned long addr, unsi
+ 		if (IS_ERR(file))
+ 			return PTR_ERR(file);
+ 	}
+-
+ 	retval = vm_mmap_pgoff(file, addr, len, prot, flags, pgoff);
+ out_fput:
+ 	if (file)
+ 		fput(file);
++
++	new_rss = current->mm->total_vm;
++	
++	if(((flags & (MAP_ANONYMOUS | MAP_PRIVATE)) != 0) && __pid_istracked(current->pid)) {
++		__restracker_change_mem(current->pid, current->tgid, (new_rss - old_rss) * PAGE_SIZE);
++	}
++
+ 	return retval;
+ }
+ 
+@@ -2764,6 +2777,8 @@ static int __vm_munmap(unsigned long start, size_t len
+ 
+ static int __vm_munmap(unsigned long start, size_t len, bool downgrade)
+ {
++	unsigned long old_rss, new_rss;
++	old_rss = current->mm->total_vm;
+ 	int ret;
+ 	struct mm_struct *mm = current->mm;
+ 	LIST_HEAD(uf);
+@@ -2785,6 +2800,10 @@ static int __vm_munmap(unsigned long start, size_t len
+ 		mmap_write_unlock(mm);
+ 
+ 	userfaultfd_unmap_complete(mm, &uf);
++	new_rss = current->mm->total_vm;
++	if((ret >= 0) && (__pid_istracked(current->pid))) {
++		__restracker_change_mem(current->pid, current->tgid, (new_rss - old_rss) * PAGE_SIZE);
++	}
+ 	return ret;
+ }
+ 
+--- linux/mm/nommu.c	2025-03-07 01:17:03
++++ linux-6.1.6/mm/nommu.c	2025-03-07 01:09:47
+@@ -41,6 +41,8 @@ void *high_memory;
+ #include <asm/mmu_context.h>
+ #include "internal.h"
+ 
++#include <linux/restracker.h>
++
+ void *high_memory;
+ EXPORT_SYMBOL(high_memory);
+ struct page *mem_map;
+@@ -381,7 +383,6 @@ SYSCALL_DEFINE1(brk, unsigned long, brk)
+ SYSCALL_DEFINE1(brk, unsigned long, brk)
+ {
+ 	struct mm_struct *mm = current->mm;
+-
+ 	if (brk < mm->start_brk || brk > mm->context.end_brk)
+ 		return mm->brk;
+ 
+@@ -392,6 +393,9 @@ SYSCALL_DEFINE1(brk, unsigned long, brk)
+ 	 * Always allow shrinking brk
+ 	 */
+ 	if (brk <= mm->brk) {
++		if(__pid_istracked(current->pid)) {
++			__restracker_change_mem(current->pid, current->tgid, brk - mm->brk);
++		}
+ 		mm->brk = brk;
+ 		return brk;
+ 	}
+@@ -400,6 +404,9 @@ SYSCALL_DEFINE1(brk, unsigned long, brk)
+ 	 * Ok, looks good - let it rip.
+ 	 */
+ 	flush_icache_user_range(mm->brk, brk);
++	if(__pid_istracked(current->pid)) {
++		__restracker_change_mem(current->pid, current->tgid, brk - mm->brk);
++	}
+ 	return mm->brk = brk;
+ }
+ 
+@@ -1281,6 +1288,8 @@ unsigned long ksys_mmap_pgoff(unsigned long addr, unsi
+ 			      unsigned long prot, unsigned long flags,
+ 			      unsigned long fd, unsigned long pgoff)
+ {
++	long old_pg_cnt, new_pg_cnt;
++	old_pg_cnt = current->mm->total_vm;
+ 	struct file *file = NULL;
+ 	unsigned long retval = -EBADF;
+ 
+@@ -1296,6 +1305,10 @@ out:
+ 	if (file)
+ 		fput(file);
+ out:
++	if(retval >= 0 && __pid_istracked(current->pid)) {
++		new_pg_cnt = current->mm->total_vm;
++		__restracked_change_mem(current->pid, (new_pg_cnt - old_pg_cnt) * PAGE_SIZE);
++	}
+ 	return retval;
+ }
+ 
+--- /dev/null	2025-03-07 01:36:26
++++ linux-6.1.6/include/linux/restracker.h	2025-03-07 01:06:51
+@@ -0,0 +1,32 @@
++#ifndef _LINUX_RESTRACKER_H
++#define _LINUX_RESTRACKER_H
++
++struct pid_node {
++    struct per_proc_resource* proc_resource;
++    struct list_head next_prev_list;
++};
++
++struct per_proc_resource {
++    pid_t pid;
++    unsigned long heapsize;
++    unsigned long openfile_count;
++    unsigned long heapsize_quota;
++    unsigned long openfile_quota;
++};
++
++struct pid_node* __restracker_node(pid_t pid);
++void __free_pid_node(struct pid_node* node);
++
++bool __pid_istracked(pid_t pid);
++long __restracker_track(pid_t pid);
++long __restracker_untrack(pid_t pid);
++
++void __restracker_change_fcnt(pid_t pid, int cnt);
++void __restracker_inc_fcnt(pid_t pid, pid_t tgid);
++void __restracker_dec_fcnt(pid_t pid, pid_t tgid);
++
++void __restracker_change_mem(pid_t pid, pid_t tgid, long val);
++
++long __set_quota(pid_t pid, long hp_q, long fs_q);
++
++#endif
+\ No newline at end of file
+--- /dev/null	2025-03-07 01:36:26
++++ linux-6.1.6/kernel/restracker.c	2025-03-07 01:08:53
+@@ -0,0 +1,276 @@
++#include <linux/types.h>
++#include <linux/errno.h>
++#include <linux/list.h>
++#include <linux/sched.h>
++#include <linux/slab.h>
++#include <linux/syscalls.h>
++#include <linux/rcupdate.h>
++#include <linux/spinlock.h>
++#include <linux/uaccess.h>
++#include <linux/restracker.h>
++#include <linux/sched/signal.h>
++
++static LIST_HEAD(tracked_tasks);
++
++static DEFINE_SPINLOCK(restracker_lock);
++
++struct pid_node* __restracker_node(pid_t pid) {
++    struct per_proc_resource* proc_res = kmalloc(sizeof(struct per_proc_resource), GFP_KERNEL);
++    if(!proc_res) return NULL;
++    proc_res->pid = pid;
++    proc_res->heapsize = 0;
++    proc_res->openfile_count = 0;
++    proc_res->heapsize_quota = -1;
++    proc_res->openfile_quota = -1;
++    struct pid_node* new_node = kmalloc(sizeof(struct pid_node), GFP_KERNEL);
++    if(!new_node) {
++        kfree(proc_res);
++        return NULL;
++    }
++    new_node->proc_resource = proc_res;
++    return new_node;
++}
++
++void __free_pid_node(struct pid_node* node) {
++    kfree(node->proc_resource);
++    kfree(node);
++}
++
++bool __pid_istracked(pid_t pid) {
++    struct pid_node *nd = NULL;
++    rcu_read_lock();
++    list_for_each_entry(nd, &tracked_tasks, next_prev_list) {
++        if(nd && nd->proc_resource && nd->proc_resource->pid == pid) {
++            rcu_read_unlock();
++            return true;
++        }
++    }
++    rcu_read_unlock();
++    return false;
++}
++
++struct per_proc_resource* __restracker_getstats(pid_t pid) {
++    struct pid_node *nd = NULL;
++    struct per_proc_resource* toret = NULL;
++    rcu_read_lock();
++    list_for_each_entry(nd, &tracked_tasks, next_prev_list) {
++        if(nd->proc_resource->pid == pid) {
++            toret = nd->proc_resource;
++            rcu_read_unlock();
++            return toret;
++        }
++    }
++    rcu_read_unlock();
++    return NULL;
++}
++
++long __restracker_track(pid_t pid) {
++    struct pid_node* new_node = __restracker_node(pid);
++
++    spin_lock(&restracker_lock);
++	list_add_rcu(&new_node->next_prev_list, &tracked_tasks);
++	spin_unlock(&restracker_lock);
++    synchronize_rcu();
++
++    pr_info("Added task with pid %d for tracking\n", pid);
++    return 0;
++}
++
++long __restracker_untrack(pid_t pid) {
++    struct pid_node* nd = NULL, *ptr = NULL;
++    spin_lock(&restracker_lock);
++    list_for_each_entry_safe(nd, ptr, &tracked_tasks, next_prev_list) {
++        if(nd->proc_resource->pid == pid) {
++            list_del(&nd->next_prev_list);
++            spin_unlock(&restracker_lock);
++            __free_pid_node(nd);
++            pr_info("Removed task with pid %d from tracking\n", pid);
++            return 0;
++        }
++    }
++	spin_unlock(&restracker_lock);
++
++    pr_info("Cannot find task with pid %d\n", pid);
++    return -1;
++}
++
++// Helper functions to update memory values and file count values
++
++void __restracker_change_fcnt(pid_t pid, int cnt) {
++    struct pid_node *nd = NULL;
++    spin_lock(&restracker_lock);
++    list_for_each_entry(nd, &tracked_tasks, next_prev_list) {
++        if(nd->proc_resource->pid == pid) {
++            nd->proc_resource->openfile_count += cnt;
++            if(nd->proc_resource->openfile_quota != -1) {
++                if(nd->proc_resource->openfile_quota < nd->proc_resource->openfile_count) {
++                    spin_unlock(&restracker_lock);
++                    unsigned long diff = nd->proc_resource->openfile_count - nd->proc_resource->openfile_quota; 
++                    struct task_struct *task = find_task_by_vpid(pid);
++                    __restracker_untrack(pid);
++                    pr_info("File quota exceeded by %lu by the process\n", diff);
++                    send_sig(SIGKILL, task, 1);
++                    return;
++                }
++            }
++            break;
++        }
++    }
++	spin_unlock(&restracker_lock);
++}
++
++void __restracker_inc_fcnt(pid_t pid, pid_t tgid) {
++    if((pid != tgid) && __pid_istracked(tgid)) {
++       __restracker_inc_fcnt(tgid, tgid);
++    }
++    __restracker_change_fcnt(pid, 1);
++}
++
++void __restracker_dec_fcnt(pid_t pid, pid_t tgid) {
++    if((pid != tgid) && __pid_istracked(tgid)) {
++       __restracker_dec_fcnt(tgid, tgid);
++    }
++    __restracker_change_fcnt(pid, -1);
++}
++
++void __restracker_change_mem(pid_t pid, pid_t tgid, long val) {
++    if((pid != tgid) && __pid_istracked(tgid)) {
++        __restracker_change_mem(tgid, tgid, val);
++    }
++    val = val / (1024 * 1024);
++    struct pid_node *nd = NULL;
++    spin_lock(&restracker_lock);
++    list_for_each_entry(nd, &tracked_tasks, next_prev_list) {
++        if(nd->proc_resource->pid == pid) {
++            nd->proc_resource->heapsize += val;
++            if(nd->proc_resource->heapsize_quota != -1) {
++                if(nd->proc_resource->heapsize_quota < nd->proc_resource->heapsize) {
++                    spin_unlock(&restracker_lock);
++                    unsigned long diff = nd->proc_resource->heapsize - nd->proc_resource->heapsize_quota;
++                    struct task_struct *task = find_task_by_vpid(pid);
++                    __restracker_untrack(pid);
++                    pr_info("Heapsize quota exceeded by %lu by the process\n", diff);
++                    send_sig(SIGKILL, task, 1);
++                    return;
++                }
++            }
++            break;
++        }
++    }
++	spin_unlock(&restracker_lock);
++}
++
++// Helper functions to settings quotas
++
++long __set_quota(pid_t pid, long hp_q, long fs_q) {
++    struct pid_node* nd;
++    bool set_h = (hp_q != -1);
++    bool set_f = (fs_q != -1);
++    spin_lock(&restracker_lock);
++    list_for_each_entry(nd, &tracked_tasks, next_prev_list) {
++        if(nd->proc_resource->pid == pid) {
++            if(!set_h && !set_f) {
++                // We are resetting the quotas if both are -1!
++                // This makes sys_resource_cap(pid, -1, -1) same as 
++                // sys_resource_reset(pid)! sounds logical
++                nd->proc_resource->heapsize_quota = hp_q;
++                nd->proc_resource->openfile_quota = fs_q;
++                break;
++            }
++            bool set_h_al = (nd->proc_resource->heapsize_quota != -1);
++            bool set_f_al = (nd->proc_resource->openfile_quota != -1);
++            if((set_h && set_h_al) || (set_f && set_f_al)) {
++                spin_unlock(&restracker_lock);
++                return -23;
++            }
++            if((set_h && !set_h_al) && (hp_q < nd->proc_resource->heapsize)) {
++                spin_unlock(&restracker_lock);
++                struct task_struct *task = find_task_by_vpid(pid);
++                __restracker_untrack(pid);
++                pr_info("Heap size quota already exceeded\n");
++                send_sig(SIGKILL, task, 1);
++                return -1;
++            }
++            if((set_f && !set_f_al) && (fs_q < nd->proc_resource->openfile_count)) {
++                spin_unlock(&restracker_lock);
++                struct task_struct *task = find_task_by_vpid(pid);
++                __restracker_untrack(pid);
++                pr_info("File quota already exceeded\n");
++                send_sig(SIGKILL, task, 1);
++                return -1;
++            }
++            if(set_h) {
++                nd->proc_resource->heapsize_quota = hp_q;
++            }
++            if(set_f) {
++                nd->proc_resource->openfile_quota = fs_q;
++            }
++            break;
++        }
++    }
++	spin_unlock(&restracker_lock);
++    return 0;
++}
++
++SYSCALL_DEFINE1(register, pid_t, pid) {
++    if(pid < 1) {
++        return -22;
++    }
++    struct task_struct* tsk = find_task_by_vpid(pid);
++    if(!tsk) {
++        return -3;
++    }
++    if(__pid_istracked(pid)) {
++        return -23;
++    }
++    int res = __restracker_track(pid);
++    return res;
++}
++
++SYSCALL_DEFINE1(deregister, pid_t, pid) {
++    if(pid < 1) {
++        return -22;
++    }
++    if(!__pid_istracked(pid)) {
++        return -3;
++    }
++    int res = __restracker_untrack(pid);
++    return res;
++}
++
++SYSCALL_DEFINE2(fetch, struct per_proc_resource __user *, stats, pid_t, pid) {
++    struct per_proc_resource *res_usage;
++    if(!__pid_istracked(pid)) {
++        return -3;
++    }
++    res_usage = __restracker_getstats(pid);
++    if(!res_usage) {
++        return -22;
++    }
++    if(copy_to_user(stats, res_usage, sizeof(struct per_proc_resource))) {
++        return -22;
++    }
++    return 0;
++}
++
++SYSCALL_DEFINE3(resource_cap, pid_t, pid, long, heap_quota, long, file_quota) {
++    struct task_struct* tsk = find_task_by_vpid(pid);
++    if(!tsk) {
++        return -3;
++    }
++    if(!__pid_istracked(pid)) {
++        return -22;
++    }
++    return __set_quota(pid, heap_quota, file_quota);
++}
++
++SYSCALL_DEFINE1(resource_reset, pid_t, pid) {
++    struct task_struct* tsk = find_task_by_vpid(pid);
++    if(!tsk) {
++        return -3;
++    }
++    if(!__pid_istracked(pid)) {
++        return -22;
++    }
++    return __set_quota(pid, -1, -1);
++}
+\ No newline at end of file
